@@ -1,0 +1,66 @@
+{
+  "name": "steam-library-mcp",
+  "version": "0.1.0",
+  "description": "A secure, minimalist, read-only MCP server for your Steam library and wishlist.",
+  "type": "module",
+  "bin": {
+    "steam-library-mcp": "dist/index.js"
+  },
+  "exports": "./dist/index.js",
+  "files": [
+    "dist",
+    "scripts/start-windows.mjs",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "PRIVACY.md",
+    "CONTRIBUTING.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "npm run format:check && npm run typecheck && npm run build && npm test",
+    "dev": "tsx src/index.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "start": "node dist/index.js",
+    "smoke:live": "node scripts/live-smoke.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run check"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "steam",
+    "steam-library",
+    "steam-wishlist",
+    "read-only",
+    "ai-tools"
+  ],
+  "author": "Jaime Guajardo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jamesmgg/steam-library-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jamesmgg/steam-library-mcp/issues"
+  },
+  "homepage": "https://github.com/jamesmgg/steam-library-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "26.2.0",
+    "prettier": "3.9.6",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
