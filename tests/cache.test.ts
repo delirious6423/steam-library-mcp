@@ -4,6 +4,52 @@ import { TtlCache } from '../src/cache.js';
 import { SteamApiError } from '../src/errors.js';
 
 describe('TtlCache', () => {
+  it('reports the remaining cooldown without mutating the original error or extending the wait', async () => {
+    let now = 0;
+    const error = new SteamApiError('STEAM_RATE_LIMITED', 'rate limited', true, 3_600);
+    const loader = vi
+      .fn<() => Promise<number>>()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValue(42);
+    const cache = new TtlCache<number>({
+      ttlMs: 1_000,
+      now: () => now,
+      retryDelayMs: () => 3_600_000,
+    });
+    await expect(cache.getOrLoad(loader)).rejects.toBe(error);
+    now = 3_540_001;
+    const failures = await Promise.all([
+      cache.getOrLoad(loader).catch((e: unknown) => e),
+      cache.getOrLoad(loader).catch((e: unknown) => e),
+    ]);
+    for (const failure of failures) {
+      expect(failure).toBeInstanceOf(SteamApiError);
+      expect(failure).toMatchObject({
+        code: error.code,
+        message: error.message,
+        retryable: true,
+        retryAfterSeconds: 60,
+      });
+      expect(failure).not.toBe(error);
+    }
+    expect(error.retryAfterSeconds).toBe(3_600);
+    now = 3_599_999;
+    await expect(cache.getOrLoad(loader)).rejects.toMatchObject({ retryAfterSeconds: 1 });
+    expect(loader).toHaveBeenCalledTimes(1);
+    now = 3_600_000;
+    await expect(cache.getOrLoad(loader)).resolves.toMatchObject({ value: 42, stale: false });
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves non-Steam errors during a configured cooldown', async () => {
+    const error = new Error('failure');
+    const loader = vi.fn<() => Promise<number>>().mockRejectedValue(error);
+    const cache = new TtlCache<number>({ ttlMs: 1_000, now: () => 0, retryDelayMs: () => 5_000 });
+    await expect(cache.getOrLoad(loader)).rejects.toBe(error);
+    await expect(cache.getOrLoad(loader)).rejects.toBe(error);
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+
   it('honors the retry cooldown across sequential and concurrent calls, then recovers', async () => {
     let now = 0;
     const cache = new TtlCache<number>({
@@ -39,7 +85,11 @@ describe('TtlCache', () => {
     const loader = vi.fn<() => Promise<number>>().mockRejectedValue(error);
     const cache = new TtlCache<number>({ ttlMs: 1_000, now: () => 0, retryDelayMs: () => 10_000 });
     await expect(cache.getOrLoad(loader)).rejects.toBe(error);
-    await expect(cache.getOrLoad(loader)).rejects.toBe(error);
+    await expect(cache.getOrLoad(loader)).rejects.toMatchObject({
+      code: error.code,
+      retryable: true,
+      retryAfterSeconds: 10,
+    });
     expect(loader).toHaveBeenCalledTimes(1);
   });
 
@@ -58,7 +108,11 @@ describe('TtlCache', () => {
     now = 1_001;
     await expect(cache.getOrLoad(loader)).resolves.toMatchObject({ stale: true });
     now = 2_001;
-    await expect(cache.getOrLoad(loader)).rejects.toBe(error);
+    await expect(cache.getOrLoad(loader)).rejects.toMatchObject({
+      code: error.code,
+      retryable: true,
+      retryAfterSeconds: 9,
+    });
     expect(loader).toHaveBeenCalledTimes(2);
   });
 

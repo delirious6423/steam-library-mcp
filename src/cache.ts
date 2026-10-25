@@ -1,3 +1,5 @@
+import { SteamApiError } from './errors.js';
+
 export interface CacheResult<T> {
   value: T;
   hit: boolean;
@@ -48,7 +50,17 @@ export class TtlCache<T> {
     }
 
     if (this.#failure && now < this.#failure.retryAtMs) {
-      return this.#fallback(this.#failure.error);
+      const { error, retryAtMs } = this.#failure;
+      return this.#fallback(
+        error instanceof SteamApiError && error.retryable
+          ? new SteamApiError(
+              error.code,
+              error.message,
+              error.retryable,
+              Math.ceil((retryAtMs - now) / 1_000),
+            )
+          : error,
+      );
     }
 
     if (this.#inFlight) {
@@ -69,7 +81,7 @@ export class TtlCache<T> {
         };
       } catch (error) {
         this.#failure = { error, retryAtMs: this.#now() + this.#retryDelayMs(error) };
-        // Never resurrect data after an explicit privacy or authentication failure.
+        // Fail closed after non-retryable errors, including privacy/authentication failures.
         if (!this.#staleIfError(error)) this.#entry = undefined;
         return this.#fallback(error);
       }

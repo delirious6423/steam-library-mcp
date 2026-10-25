@@ -79,7 +79,14 @@ describe('Steam Library MCP server', () => {
     const call = () => client.callTool({ name: 'steam_list_owned_games', arguments: {} });
     expect((await call()).isError).toBe(true);
     vi.setSystemTime(new Date('2026-10-21T07:27:59Z'));
-    expect((await call()).isError).toBe(true);
+    const waiting = await call();
+    expect(waiting.isError).toBe(true);
+    expect(waiting.content).toEqual([
+      expect.objectContaining({
+        type: 'text',
+        text: expect.stringContaining('"retryAfterSeconds":1'),
+      }),
+    ]);
     expect(fetchFn).toHaveBeenCalledTimes(1);
     vi.setSystemTime(new Date('2026-10-21T07:28:00Z'));
     await call();
@@ -105,6 +112,43 @@ describe('Steam Library MCP server', () => {
     await call();
     expect(getOwnedGames).toHaveBeenCalledTimes(3);
   });
+
+  it.each(['STEAM_RESPONSE_TOO_LARGE', 'STEAM_BAD_RESPONSE', 'STEAM_AUTH_FAILED'] as const)(
+    'pauses catalog retries for one hour after %s without hiding wishlist AppIDs',
+    async (code) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(0);
+      const getAppCatalog = vi
+        .fn<SteamDataSource['getAppCatalog']>()
+        .mockRejectedValueOnce(new SteamApiError(code, 'catalog unavailable', false))
+        .mockResolvedValue(new Map([[1, 'Portal']]));
+      const client = await connect(
+        dataSource({ getAppCatalog, getWishlist: async () => [wishlistItem(1)] }),
+      );
+      const call = () => client.callTool({ name: 'steam_list_wishlist', arguments: {} });
+      expect((await call()).structuredContent).toMatchObject({
+        catalog: { status: 'unavailable' },
+        items: [{ appId: 1, name: null }],
+      });
+      vi.setSystemTime(3_599_999);
+      const pages = await Promise.all([call(), call()]);
+      for (const page of pages) {
+        expect(page.isError).not.toBe(true);
+        expect(page.structuredContent).toMatchObject({
+          catalog: { status: 'unavailable' },
+          counts: { total: 1 },
+          items: [{ appId: 1, name: null }],
+        });
+      }
+      expect(getAppCatalog).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(3_600_000);
+      expect((await call()).structuredContent).toMatchObject({
+        catalog: { status: 'complete' },
+        items: [{ appId: 1, name: 'Portal' }],
+      });
+      expect(getAppCatalog).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it('backs off failed optional catalog enrichment for five seconds', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });

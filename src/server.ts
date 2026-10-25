@@ -187,7 +187,8 @@ export function createSteamLibraryServer(options: CreateSteamLibraryServerOption
     ttlMs: 24 * 60 * 60_000,
     maxStaleMs: 7 * 24 * 60 * 60_000,
     staleIfError: staleOnRetryable,
-    retryDelayMs,
+    retryDelayMs: (error) =>
+      error instanceof SteamApiError && !error.retryable ? 60 * 60_000 : retryDelayMs(error),
   });
 
   const server = new McpServer(
