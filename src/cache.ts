@@ -15,6 +15,7 @@ export interface TtlCacheOptions {
   maxStaleMs?: number;
   now?: () => number;
   staleIfError?: (error: unknown) => boolean;
+  retryDelayMs?: (error: unknown) => number;
 }
 
 export class TtlCache<T> {
@@ -22,6 +23,8 @@ export class TtlCache<T> {
   readonly #maxStaleMs: number;
   readonly #now: () => number;
   readonly #staleIfError: (error: unknown) => boolean;
+  readonly #retryDelayMs: (error: unknown) => number;
+  #failure: { error: unknown; retryAtMs: number } | undefined;
   #entry: CacheEntry<T> | undefined;
   #inFlight: Promise<CacheResult<T>> | undefined;
 
@@ -30,6 +33,7 @@ export class TtlCache<T> {
     this.#maxStaleMs = options.maxStaleMs ?? 0;
     this.#now = options.now ?? Date.now;
     this.#staleIfError = options.staleIfError ?? (() => false);
+    this.#retryDelayMs = options.retryDelayMs ?? (() => 0);
   }
 
   async getOrLoad(loader: () => Promise<T>): Promise<CacheResult<T>> {
@@ -43,6 +47,10 @@ export class TtlCache<T> {
       };
     }
 
+    if (this.#failure && now < this.#failure.retryAtMs) {
+      return this.#fallback(this.#failure.error);
+    }
+
     if (this.#inFlight) {
       return this.#inFlight;
     }
@@ -52,6 +60,7 @@ export class TtlCache<T> {
         const value = await loader();
         const fetchedAtMs = this.#now();
         this.#entry = { value, fetchedAtMs };
+        this.#failure = undefined;
         return {
           value,
           hit: false,
@@ -59,18 +68,10 @@ export class TtlCache<T> {
           fetchedAt: new Date(fetchedAtMs).toISOString(),
         };
       } catch (error) {
-        const staleAge = this.#entry
-          ? this.#now() - this.#entry.fetchedAtMs
-          : Number.POSITIVE_INFINITY;
-        if (this.#entry && staleAge <= this.#maxStaleMs && this.#staleIfError(error)) {
-          return {
-            value: this.#entry.value,
-            hit: true,
-            stale: true,
-            fetchedAt: new Date(this.#entry.fetchedAtMs).toISOString(),
-          };
-        }
-        throw error;
+        this.#failure = { error, retryAtMs: this.#now() + this.#retryDelayMs(error) };
+        // Never resurrect data after an explicit privacy or authentication failure.
+        if (!this.#staleIfError(error)) this.#entry = undefined;
+        return this.#fallback(error);
       }
     })();
     try {
@@ -78,5 +79,21 @@ export class TtlCache<T> {
     } finally {
       this.#inFlight = undefined;
     }
+  }
+
+  #fallback(error: unknown): CacheResult<T> {
+    if (
+      this.#entry &&
+      this.#now() - this.#entry.fetchedAtMs <= this.#maxStaleMs &&
+      this.#staleIfError(error)
+    ) {
+      return {
+        value: this.#entry.value,
+        hit: true,
+        stale: true,
+        fetchedAt: new Date(this.#entry.fetchedAtMs).toISOString(),
+      };
+    }
+    throw error;
   }
 }

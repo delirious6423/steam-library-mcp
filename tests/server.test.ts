@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SteamApiError } from '../src/errors.js';
 import { createSteamLibraryServer, type SteamDataSource } from '../src/server.js';
-import type { OwnedGame, WishlistItem } from '../src/steam-client.js';
+import { SteamClient, type OwnedGame, type WishlistItem } from '../src/steam-client.js';
 
 function ownedGame(appId: number): OwnedGame {
   return {
@@ -59,9 +59,130 @@ async function connect(source: SteamDataSource) {
 afterEach(async () => {
   await Promise.all(openClients.splice(0).map((client) => client.close()));
   await Promise.all(openServers.splice(0).map((server) => server.close()));
+  vi.useRealTimers();
 });
 
 describe('Steam Library MCP server', () => {
+  it('does not fetch again before an HTTP-date Retry-After deadline', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-21T07:26:00Z'));
+    const fetchFn = vi.fn<typeof fetch>().mockImplementation(
+      async () =>
+        new Response('', {
+          status: 429,
+          headers: { 'retry-after': 'Wed, 21 Oct 2026 07:28:00 GMT' },
+        }),
+    );
+    const client = await connect(
+      new SteamClient({ apiKey: 'B'.repeat(32), steamId64: '76561197960265728' }, { fetchFn }),
+    );
+    const call = () => client.callTool({ name: 'steam_list_owned_games', arguments: {} });
+    expect((await call()).isError).toBe(true);
+    vi.setSystemTime(new Date('2026-10-21T07:27:59Z'));
+    expect((await call()).isError).toBe(true);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(new Date('2026-10-21T07:28:00Z'));
+    await call();
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('honors Steam Retry-After while returning stale library pages', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(0);
+    const getOwnedGames = vi
+      .fn<SteamDataSource['getOwnedGames']>()
+      .mockResolvedValueOnce([ownedGame(1)])
+      .mockRejectedValue(new SteamApiError('STEAM_RATE_LIMITED', 'rate limited', true, 30));
+    const client = await connect(dataSource({ getOwnedGames }));
+    const call = () => client.callTool({ name: 'steam_list_owned_games', arguments: {} });
+    await call();
+    vi.setSystemTime(300_001);
+    expect((await call()).structuredContent).toMatchObject({ cache: { stale: true } });
+    vi.setSystemTime(330_000);
+    expect((await call()).structuredContent).toMatchObject({ cache: { stale: true } });
+    expect(getOwnedGames).toHaveBeenCalledTimes(2);
+    vi.setSystemTime(330_001);
+    await call();
+    expect(getOwnedGames).toHaveBeenCalledTimes(3);
+  });
+
+  it('backs off failed optional catalog enrichment for five seconds', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(0);
+    const getAppCatalog = vi
+      .fn<SteamDataSource['getAppCatalog']>()
+      .mockRejectedValue(new SteamApiError('STEAM_UPSTREAM_UNAVAILABLE', 'outage', true));
+    const client = await connect(
+      dataSource({ getAppCatalog, getWishlist: async () => [wishlistItem(1)] }),
+    );
+    const call = () => client.callTool({ name: 'steam_list_wishlist', arguments: {} });
+    await call();
+    vi.setSystemTime(4_999);
+    expect((await call()).structuredContent).toMatchObject({ catalog: { status: 'unavailable' } });
+    expect(getAppCatalog).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(5_000);
+    await call();
+    expect(getAppCatalog).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['disabled', 'partial', 'unavailable'] as const)(
+    'marks name searches incomplete when catalog enrichment is %s',
+    async (mode) => {
+      const getAppCatalog = vi.fn<SteamDataSource['getAppCatalog']>();
+      if (mode === 'unavailable') getAppCatalog.mockRejectedValue(new Error('unavailable'));
+      else getAppCatalog.mockResolvedValue(new Map([[1, 'Other game']]));
+      const client = await connect(
+        dataSource({
+          getWishlist: async () => [wishlistItem(1), wishlistItem(2)],
+          getAppCatalog,
+        }),
+      );
+      const result = await client.callTool({
+        name: 'steam_list_wishlist',
+        arguments: { query: 'Portal', includeNames: mode !== 'disabled' },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        search: { complete: false, missingNameCount: mode === 'partial' ? 1 : 2 },
+        counts: { total: 2, matched: 0 },
+        warning: expect.stringContaining('lower bound'),
+      });
+      expect(JSON.stringify(result.content)).toContain('Search is incomplete');
+      if (mode === 'disabled') expect(getAppCatalog).not.toHaveBeenCalled();
+    },
+  );
+
+  it('marks fully named searches and unfiltered raw listings complete', async () => {
+    const client = await connect(
+      dataSource({
+        getWishlist: async () => [wishlistItem(1), wishlistItem(2)],
+        getAppCatalog: async () =>
+          new Map([
+            [1, 'Portal'],
+            [2, 'Other game'],
+          ]),
+      }),
+    );
+    const named = await client.callTool({
+      name: 'steam_list_wishlist',
+      arguments: { query: 'Portal' },
+    });
+    expect(named.structuredContent).toMatchObject({
+      search: { complete: true, missingNameCount: 0 },
+      counts: { matched: 1 },
+      warning: null,
+    });
+    const raw = await client.callTool({
+      name: 'steam_list_wishlist',
+      arguments: { includeNames: false },
+    });
+    expect(raw.structuredContent).toMatchObject({
+      search: { complete: true, missingNameCount: 2 },
+      counts: { total: 2, matched: 2 },
+      warning: null,
+    });
+  });
+
   it('advertises only four read-only, non-destructive tools', async () => {
     const client = await connect(dataSource());
 
@@ -167,7 +288,11 @@ describe('Steam Library MCP server', () => {
       arguments: { offset: 0, limit: 1, includeNames: true },
     });
 
-    expect(result.structuredContent).toMatchObject({ catalog: { status: 'partial' } });
+    expect(result.structuredContent).toMatchObject({
+      catalog: { status: 'partial' },
+      search: { complete: true, missingNameCount: 2 },
+      warning: expect.stringContaining('Some wishlist game names are unavailable'),
+    });
   });
 
   it('keeps valid wishlist AppIDs when optional catalog enrichment fails', async () => {
