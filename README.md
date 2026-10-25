@@ -111,6 +111,12 @@ Steam currently returns the whole wishlist in one response, so this server fetch
 
 For available wishlists, the server independently checks `GetWishlistItemCount` and rejects a mismatch rather than presenting a truncated list as complete.
 
+Wishlist results include `search.complete` and `search.missingNameCount`. When a query is supplied and names are missing (including when `includeNames` is false), the matched count is only a lower bound: zero known matches does not prove the game is absent. A warning explains the limitation. List without a query to retrieve every AppID, even when names are unavailable.
+
+Catalog enrichment has a 30-second overall deadline and limits of 64 MiB total response bytes and 1,000,000 received app entries across all pages. Hitting a limit leaves raw wishlist AppIDs usable without names.
+
+Temporary upstream failures use a five-second retry cooldown; rate-limit responses honor Steam's `Retry-After` delay (integer seconds or an HTTP date, bounded to one second through one hour). Eligible stale data remains available during the cooldown without extending its original maximum age. Authentication or privacy failures invalidate the cached data.
+
 ## Security and privacy
 
 - Tools cannot select another SteamID or proxy arbitrary requests.
