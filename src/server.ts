@@ -93,6 +93,7 @@ const WishlistOutputSchema = z.object({
   warning: z.string().nullable(),
   cache: CacheSchema,
   catalog: CatalogSchema,
+  search: z.object({ complete: z.boolean(), missingNameCount: z.number().int().nonnegative() }),
   counts: CountsSchema,
   page: PageSchema,
   items: z.array(WishlistItemSchema),
@@ -157,27 +158,37 @@ function staleOnRetryable(error: unknown) {
   return error instanceof SteamApiError && error.retryable;
 }
 
+function retryDelayMs(error: unknown): number {
+  if (!(error instanceof SteamApiError) || !error.retryable) return 0;
+  return Math.max(1_000, Math.min(error.retryAfterSeconds ?? 5, 3_600) * 1_000);
+}
+
 export function createSteamLibraryServer(options: CreateSteamLibraryServerOptions = {}): McpServer {
   const source = options.source ?? new SteamClient(loadConfig());
   const ownedCache = new TtlCache<OwnedGame[]>({
     ttlMs: 5 * 60_000,
     maxStaleMs: 60 * 60_000,
     staleIfError: staleOnRetryable,
+    retryDelayMs,
   });
   const recentCache = new TtlCache<OwnedGame[]>({
     ttlMs: 60_000,
     maxStaleMs: 60 * 60_000,
     staleIfError: staleOnRetryable,
+    retryDelayMs,
   });
   const wishlistCache = new TtlCache<WishlistItem[]>({
     ttlMs: 5 * 60_000,
     maxStaleMs: 60 * 60_000,
     staleIfError: staleOnRetryable,
+    retryDelayMs,
   });
   const catalogCache = new TtlCache<Map<number, string>>({
     ttlMs: 24 * 60 * 60_000,
     maxStaleMs: 7 * 24 * 60 * 60_000,
     staleIfError: staleOnRetryable,
+    retryDelayMs: (error) =>
+      error instanceof SteamApiError && !error.retryable ? 60 * 60_000 : retryDelayMs(error),
   });
 
   const server = new McpServer(
@@ -286,7 +297,9 @@ export function createSteamLibraryServer(options: CreateSteamLibraryServerOption
         'Fetch the complete wishlist, then search, sort, and paginate it locally. Wishlist access is experimental; Steam does not distinguish empty, private, and unavailable responses.',
       inputSchema: z
         .object({
-          query: QuerySchema.describe('Optional case-insensitive game-name or AppID search.'),
+          query: QuerySchema.describe(
+            'Optional case-insensitive game-name or AppID search. Missing names make results incomplete; check search.complete.',
+          ),
           sort: z.enum(['priority', 'date_added_desc']).default('priority'),
           includeNames: z
             .boolean()
@@ -316,17 +329,22 @@ export function createSteamLibraryServer(options: CreateSteamLibraryServerOption
         }
 
         const page = createWishlistPage(wishlist.value, catalog, input);
-        const missingNames = wishlist.value.some((item) => !catalog.has(item.appId));
+        const missingNameCount = wishlist.value.filter((item) => !catalog.has(item.appId)).length;
+        const searchComplete = !input.query || missingNameCount === 0;
         const catalogStatus = !input.includeNames
           ? 'not_requested'
           : catalogUnavailable
             ? 'unavailable'
-            : missingNames
+            : missingNameCount > 0
               ? 'partial'
               : 'complete';
-        const warning = catalogUnavailable
-          ? 'Wishlist AppIDs are valid, but Steam catalog name enrichment was unavailable.'
-          : null;
+        const warning = !searchComplete
+          ? 'Search is incomplete because some game names are unavailable. The matched count is a lower bound, not proof that other games are absent. List without a query to retrieve every AppID.'
+          : catalogUnavailable
+            ? 'Wishlist AppIDs are valid, but Steam catalog name enrichment was unavailable.'
+            : input.includeNames && missingNameCount > 0
+              ? 'Some wishlist game names are unavailable; all AppIDs remain accessible.'
+              : null;
         const output = {
           experimental: true as const,
           warning,
@@ -335,11 +353,12 @@ export function createSteamLibraryServer(options: CreateSteamLibraryServerOption
             status: catalogStatus,
             cache: catalogResult ? cacheMetadata(catalogResult) : null,
           },
+          search: { complete: searchComplete, missingNameCount },
           ...page,
         };
         return successResult(
           output,
-          `Returned ${page.page.returned} of ${page.counts.matched} matching wishlist items (${page.counts.total} total).`,
+          `Returned ${page.page.returned} of ${page.counts.matched} known matching wishlist items (${page.counts.total} total).${searchComplete ? '' : ' Search is incomplete; missing names may hide matches.'}`,
         );
       } catch (error) {
         return errorResult(error);

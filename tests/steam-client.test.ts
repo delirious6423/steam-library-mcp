@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { SteamClient } from '../src/steam-client.js';
 
@@ -6,6 +6,18 @@ const TEST_CONFIG = {
   apiKey: 'B'.repeat(32),
   steamId64: '76561197960265728',
 };
+
+function catalogPage(appId: number, more: boolean): string {
+  return JSON.stringify({
+    response: {
+      apps: [{ appid: appId, name: `Game ${appId} 🎮` }],
+      have_more_results: more,
+      last_appid: appId,
+    },
+  });
+}
+
+const JSON_HEADERS = { 'content-type': 'application/json' };
 
 describe('SteamClient', () => {
   it('returns every owned game beyond the first 50 without putting the key in the URL', async () => {
@@ -100,6 +112,30 @@ describe('SteamClient', () => {
     expect(error).toMatchObject({ code: 'STEAM_AUTH_FAILED', retryable: false });
     expect(String(error)).not.toContain(TEST_CONFIG.apiKey);
     expect(String(error)).not.toContain('rejected key');
+  });
+
+  it.each([
+    ['999999', 3_600],
+    ['Wed, 21 Oct 2026 07:28:00 GMT', 120],
+    ['Wed, 21 Oct 2026 07:25:00 GMT', 0],
+    ['invalid', undefined],
+    ['45oops', undefined],
+    ['-1', undefined],
+  ])('parses and bounds Retry-After %s', async (header, expected) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-21T07:26:00Z'));
+    try {
+      const client = new SteamClient(TEST_CONFIG, {
+        fetchFn: async () =>
+          new Response('', { status: 429, headers: { 'retry-after': String(header) } }),
+      });
+      await expect(client.getOwnedGames()).rejects.toMatchObject({
+        code: 'STEAM_RATE_LIMITED',
+        retryAfterSeconds: expected,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reports bounded Retry-After metadata for rate limits', async () => {
@@ -361,6 +397,189 @@ describe('SteamClient', () => {
     expect(requestedUrls[0]).toContain('/IStoreService/GetAppList/v1/');
     expect(requestedUrls[0]).not.toContain(TEST_CONFIG.apiKey);
     expect(decodeURIComponent(requestedUrls[1] ?? '')).toContain('"last_appid":20');
+  });
+
+  it.each(['missing', 'understated', 'accurate'])(
+    'bounds cumulative catalog bytes with %s Content-Length and cancels rejected bodies',
+    async (lengthMode) => {
+      const first = catalogPage(10, true);
+      const second = catalogPage(20, false);
+      const encoder = new TextEncoder();
+      let requests = 0;
+      const cancel = vi.fn();
+      const client = new SteamClient(TEST_CONFIG, {
+        catalogLimits: {
+          maxBytes: encoder.encode(first).byteLength + encoder.encode(second).byteLength - 1,
+        },
+        fetchFn: async () => {
+          requests += 1;
+          if (requests === 1) return new Response(first, { headers: JSON_HEADERS });
+          const headers = new Headers(JSON_HEADERS);
+          if (lengthMode !== 'missing') {
+            headers.set(
+              'content-length',
+              lengthMode === 'understated' ? '1' : String(encoder.encode(second).byteLength),
+            );
+          }
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(encoder.encode(second));
+              },
+              cancel,
+            }),
+            { headers },
+          );
+        },
+      });
+
+      await expect(client.getAppCatalog()).rejects.toMatchObject({
+        code: 'STEAM_RESPONSE_TOO_LARGE',
+        retryable: false,
+      });
+      expect(requests).toBe(2);
+      expect(cancel).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('allows a complete multi-page catalog exactly at the byte and item budgets', async () => {
+    const pages = [catalogPage(10, true), catalogPage(20, false)];
+    const client = new SteamClient(TEST_CONFIG, {
+      catalogLimits: {
+        maxBytes: pages.reduce((sum, body) => sum + new TextEncoder().encode(body).byteLength, 0),
+        maxItems: 2,
+      },
+      fetchFn: async () => new Response(pages.shift(), { headers: JSON_HEADERS }),
+    });
+
+    await expect(client.getAppCatalog()).resolves.toEqual(
+      new Map([
+        [10, 'Game 10 🎮'],
+        [20, 'Game 20 🎮'],
+      ]),
+    );
+    expect(pages).toHaveLength(0);
+  });
+
+  it('bounds total received catalog items even when pages repeat an AppID', async () => {
+    let requests = 0;
+    const client = new SteamClient(TEST_CONFIG, {
+      catalogLimits: { maxItems: 1 },
+      fetchFn: async () => {
+        requests += 1;
+        return new Response(catalogPage(10, requests === 1), { headers: JSON_HEADERS });
+      },
+    });
+
+    await expect(client.getAppCatalog()).rejects.toMatchObject({
+      code: 'STEAM_RESPONSE_TOO_LARGE',
+      retryable: false,
+    });
+    expect(requests).toBe(2);
+  });
+
+  it('uses one catalog deadline across pages and aborts the outstanding fetch', async () => {
+    vi.useFakeTimers();
+    try {
+      let requests = 0;
+      let activeSignal: AbortSignal | null | undefined;
+      const client = new SteamClient(TEST_CONFIG, {
+        catalogLimits: { timeoutMs: 100 },
+        fetchFn: async (_input, init) => {
+          requests += 1;
+          activeSignal = init?.signal;
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, 60);
+            activeSignal?.addEventListener(
+              'abort',
+              () => {
+                clearTimeout(timer);
+                reject(new Error('aborted'));
+              },
+              { once: true },
+            );
+          });
+          return new Response(catalogPage(requests * 10, true), { headers: JSON_HEADERS });
+        },
+      });
+      const result = expect(client.getAppCatalog()).rejects.toMatchObject({
+        code: 'STEAM_UPSTREAM_UNAVAILABLE',
+        retryable: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      await result;
+      expect(requests).toBe(2);
+      expect(activeSignal?.aborted).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves the per-response timeout when the catalog deadline is longer', async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn();
+      const client = new SteamClient(TEST_CONFIG, {
+        catalogLimits: { timeoutMs: 30_000 },
+        fetchFn: async () =>
+          new Response(new ReadableStream<Uint8Array>({ cancel }), { headers: JSON_HEADERS }),
+      });
+      const result = expect(client.getAppCatalog()).rejects.toMatchObject({
+        code: 'STEAM_UPSTREAM_UNAVAILABLE',
+        retryable: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await result;
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a stalled catalog body at the whole-operation deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn();
+      const client = new SteamClient(TEST_CONFIG, {
+        catalogLimits: { timeoutMs: 100 },
+        fetchFn: async () =>
+          new Response(new ReadableStream<Uint8Array>({ cancel }), { headers: JSON_HEADERS }),
+      });
+      const result = expect(client.getAppCatalog()).rejects.toMatchObject({
+        code: 'STEAM_UPSTREAM_UNAVAILABLE',
+        retryable: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      await result;
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { status: 503, headers: JSON_HEADERS, code: 'STEAM_UPSTREAM_UNAVAILABLE' },
+    { status: 200, headers: { 'content-type': 'text/html' }, code: 'STEAM_BAD_RESPONSE' },
+    {
+      status: 200,
+      headers: { ...JSON_HEADERS, 'content-length': String(65 * 1024 * 1024) },
+      code: 'STEAM_RESPONSE_TOO_LARGE',
+    },
+  ])('cancels early-rejected response bodies ($code)', async ({ status, headers, code }) => {
+    const cancel = vi.fn();
+    const client = new SteamClient(TEST_CONFIG, {
+      fetchFn: async () =>
+        new Response(new ReadableStream<Uint8Array>({ cancel }), { status, headers }),
+    });
+
+    await expect(client.getAppCatalog()).rejects.toMatchObject({ code });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('stops a catalog continuation marker that does not advance', async () => {

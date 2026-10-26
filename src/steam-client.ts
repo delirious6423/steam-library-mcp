@@ -97,6 +97,7 @@ export interface WishlistItem {
 
 export interface SteamClientOptions {
   fetchFn?: typeof fetch;
+  catalogLimits?: { maxBytes?: number; maxItems?: number; timeoutMs?: number };
 }
 
 type UpstreamOwnedGame = z.infer<typeof OwnedGameSchema>;
@@ -104,6 +105,11 @@ type UpstreamOwnedGame = z.infer<typeof OwnedGameSchema>;
 const STANDARD_RESPONSE_LIMIT_BYTES = 16 * 1024 * 1024;
 const CATALOG_RESPONSE_LIMIT_BYTES = 64 * 1024 * 1024;
 const MAX_CATALOG_PAGES = 100;
+const CATALOG_TOTAL_LIMIT_BYTES = 64 * 1024 * 1024;
+const CATALOG_TOTAL_LIMIT_ITEMS = 1_000_000;
+const CATALOG_TIMEOUT_MS = 30_000;
+
+type ByteBudget = { remainingBytes: number };
 
 function badResponse(message: string): SteamApiError {
   return new SteamApiError('STEAM_BAD_RESPONSE', message, false);
@@ -119,7 +125,12 @@ function sanitizeName(name: string): string {
   );
 }
 
-async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
+async function readBoundedJson(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+  budget?: ByteBudget,
+): Promise<unknown> {
   const contentType = response.headers.get('content-type')?.toLocaleLowerCase() ?? '';
   if (!contentType.includes('application/json')) {
     throw badResponse('Steam returned a response that was not JSON.');
@@ -139,19 +150,33 @@ async function readBoundedJson(response: Response, maxBytes: number): Promise<un
   try {
     if (response.body) {
       const reader = response.body.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        totalBytes += value.byteLength;
-        if (totalBytes > maxBytes) {
-          await reader.cancel();
-          throw new SteamApiError(
-            'STEAM_RESPONSE_TOO_LARGE',
-            'Steam returned a response larger than the configured safety limit.',
-            false,
-          );
+      const cancel = () => {
+        void reader.cancel().catch(() => {});
+      };
+      signal.addEventListener('abort', cancel, { once: true });
+      try {
+        signal.throwIfAborted();
+        for (;;) {
+          const { done, value } = await reader.read();
+          signal.throwIfAborted();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > maxBytes) {
+            throw new SteamApiError(
+              'STEAM_RESPONSE_TOO_LARGE',
+              'Steam returned a response larger than the configured safety limit.',
+              false,
+            );
+          }
+          if (budget) budget.remainingBytes -= value.byteLength;
+          chunks.push(value);
         }
-        chunks.push(value);
+      } catch (error) {
+        cancel();
+        throw error;
+      } finally {
+        signal.removeEventListener('abort', cancel);
+        reader.releaseLock();
       }
     }
   } catch (error) {
@@ -208,16 +233,42 @@ function normalizeGame(game: UpstreamOwnedGame): OwnedGame {
 export class SteamClient {
   readonly #config: SteamConfig;
   readonly #fetch: typeof fetch;
+  readonly #catalogLimits: { maxBytes: number; maxItems: number; timeoutMs: number };
 
   constructor(config: SteamConfig, options: SteamClientOptions = {}) {
     this.#config = config;
     this.#fetch = options.fetchFn ?? fetch;
+    this.#catalogLimits = {
+      maxBytes: options.catalogLimits?.maxBytes ?? CATALOG_TOTAL_LIMIT_BYTES,
+      maxItems: options.catalogLimits?.maxItems ?? CATALOG_TOTAL_LIMIT_ITEMS,
+      timeoutMs: options.catalogLimits?.timeoutMs ?? CATALOG_TIMEOUT_MS,
+    };
+    for (const value of Object.values(this.#catalogLimits)) {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new RangeError('Catalog limits must be positive safe integers.');
+      }
+    }
   }
 
   async #requestJson(
     url: URL,
-    options: { authenticated: boolean; maxBytes?: number },
+    options: {
+      authenticated: boolean;
+      maxBytes?: number;
+      signal?: AbortSignal;
+      budget?: ByteBudget;
+    },
   ): Promise<unknown> {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const timer = setTimeout(abort, 10_000);
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
+    const signal = controller.signal;
+    const cleanup = () => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener('abort', abort);
+    };
     let response: Response;
     try {
       response = await this.#fetch(url, {
@@ -226,44 +277,73 @@ export class SteamClient {
           ...(options.authenticated ? { 'x-webapi-key': this.#config.apiKey } : {}),
         },
         redirect: 'error',
-        signal: AbortSignal.timeout(10_000),
+        signal,
       });
     } catch {
+      cleanup();
       throw new SteamApiError('STEAM_UPSTREAM_UNAVAILABLE', 'Steam could not be reached.', true);
     }
 
-    if (!response.ok) {
-      if (options.authenticated && (response.status === 401 || response.status === 403)) {
+    try {
+      signal.throwIfAborted();
+      if (!response.ok) {
+        if (options.authenticated && (response.status === 401 || response.status === 403)) {
+          throw new SteamApiError(
+            'STEAM_AUTH_FAILED',
+            'Steam rejected the configured Web API key.',
+            false,
+          );
+        }
+        if (!options.authenticated && (response.status === 401 || response.status === 403)) {
+          throw new SteamApiError(
+            'STEAM_WISHLIST_UNAVAILABLE',
+            'Steam did not expose the configured account wishlist.',
+            false,
+          );
+        }
+        if (response.status === 429) {
+          const value = response.headers.get('retry-after')?.trim() ?? '';
+          const retryAfter = /^\d+$/.test(value)
+            ? Number(value)
+            : /^[A-Za-z]/.test(value)
+              ? Math.ceil((Date.parse(value) - Date.now()) / 1_000)
+              : NaN;
+          throw new SteamApiError(
+            'STEAM_RATE_LIMITED',
+            'Steam rate-limited the request.',
+            true,
+            Number.isFinite(retryAfter) ? Math.min(Math.max(retryAfter, 0), 3_600) : undefined,
+          );
+        }
         throw new SteamApiError(
-          'STEAM_AUTH_FAILED',
-          'Steam rejected the configured Web API key.',
-          false,
+          'STEAM_UPSTREAM_UNAVAILABLE',
+          `Steam returned HTTP ${response.status}.`,
+          response.status >= 500,
         );
       }
-      if (!options.authenticated && (response.status === 401 || response.status === 403)) {
-        throw new SteamApiError(
-          'STEAM_WISHLIST_UNAVAILABLE',
-          'Steam did not expose the configured account wishlist.',
-          false,
-        );
-      }
-      if (response.status === 429) {
-        const retryAfter = Number.parseInt(response.headers.get('retry-after') ?? '', 10);
-        throw new SteamApiError(
-          'STEAM_RATE_LIMITED',
-          'Steam rate-limited the request.',
-          true,
-          Number.isFinite(retryAfter) ? Math.min(Math.max(retryAfter, 0), 3_600) : undefined,
-        );
-      }
+
+      return await readBoundedJson(
+        response,
+        Math.min(
+          options.maxBytes ?? STANDARD_RESPONSE_LIMIT_BYTES,
+          options.budget?.remainingBytes ?? Infinity,
+        ),
+        signal,
+        options.budget,
+      );
+    } catch (error) {
+      if (error instanceof SteamApiError) throw error;
       throw new SteamApiError(
         'STEAM_UPSTREAM_UNAVAILABLE',
-        `Steam returned HTTP ${response.status}.`,
-        response.status >= 500,
+        'Steam disconnected while returning a response.',
+        true,
       );
+    } finally {
+      cleanup();
+      if (response.body && !response.body.locked) {
+        void response.body.cancel().catch(() => {});
+      }
     }
-
-    return readBoundedJson(response, options.maxBytes ?? STANDARD_RESPONSE_LIMIT_BYTES);
   }
 
   async getOwnedGames(): Promise<OwnedGame[]> {
@@ -361,44 +441,76 @@ export class SteamClient {
   async getAppCatalog(): Promise<Map<number, string>> {
     const catalog = new Map<number, string>();
     let lastAppId: number | undefined;
-
-    for (let page = 0; page < MAX_CATALOG_PAGES; page += 1) {
-      const url = new URL('https://api.steampowered.com/IStoreService/GetAppList/v1/');
-      const input: Record<string, boolean | number> = {
-        include_games: true,
-        max_results: 50_000,
-      };
-      if (lastAppId !== undefined) {
-        input.last_appid = lastAppId;
-      }
-      url.searchParams.set('input_json', JSON.stringify(input));
-
-      const parsed = parseResponse(
-        AppCatalogResponseSchema,
-        await this.#requestJson(url, {
-          authenticated: true,
-          maxBytes: CATALOG_RESPONSE_LIMIT_BYTES,
-        }),
-      ).response;
-      for (const app of parsed.apps) {
-        catalog.set(app.appid, sanitizeName(app.name));
-      }
-      if (!parsed.have_more_results) {
-        return catalog;
-      }
-      if (parsed.last_appid === undefined) {
+    let totalItems = 0;
+    const budget: ByteBudget = { remainingBytes: this.#catalogLimits.maxBytes };
+    const controller = new AbortController();
+    const deadline = performance.now() + this.#catalogLimits.timeoutMs;
+    const timer = setTimeout(() => controller.abort(), this.#catalogLimits.timeoutMs);
+    const checkDeadline = () => {
+      if (controller.signal.aborted || performance.now() >= deadline) {
+        controller.abort();
         throw new SteamApiError(
-          'STEAM_BAD_RESPONSE',
-          'Steam omitted the catalog continuation marker.',
-          false,
+          'STEAM_UPSTREAM_UNAVAILABLE',
+          'Steam catalog retrieval timed out.',
+          true,
         );
       }
-      if (lastAppId !== undefined && parsed.last_appid <= lastAppId) {
-        throw badResponse('Steam returned a catalog continuation marker that did not advance.');
-      }
-      lastAppId = parsed.last_appid;
-    }
+    };
 
-    throw badResponse('Steam returned too many catalog continuation pages.');
+    try {
+      for (let page = 0; page < MAX_CATALOG_PAGES; page += 1) {
+        checkDeadline();
+        const url = new URL('https://api.steampowered.com/IStoreService/GetAppList/v1/');
+        const input: Record<string, boolean | number> = {
+          include_games: true,
+          max_results: 50_000,
+        };
+        if (lastAppId !== undefined) {
+          input.last_appid = lastAppId;
+        }
+        url.searchParams.set('input_json', JSON.stringify(input));
+
+        const parsed = parseResponse(
+          AppCatalogResponseSchema,
+          await this.#requestJson(url, {
+            authenticated: true,
+            maxBytes: CATALOG_RESPONSE_LIMIT_BYTES,
+            signal: controller.signal,
+            budget,
+          }),
+        ).response;
+        checkDeadline();
+        totalItems += parsed.apps.length;
+        if (totalItems > this.#catalogLimits.maxItems) {
+          throw new SteamApiError(
+            'STEAM_RESPONSE_TOO_LARGE',
+            'Steam returned more catalog items than the configured safety limit.',
+            false,
+          );
+        }
+        for (const app of parsed.apps) {
+          catalog.set(app.appid, sanitizeName(app.name));
+        }
+        checkDeadline();
+        if (!parsed.have_more_results) {
+          return catalog;
+        }
+        if (parsed.last_appid === undefined) {
+          throw new SteamApiError(
+            'STEAM_BAD_RESPONSE',
+            'Steam omitted the catalog continuation marker.',
+            false,
+          );
+        }
+        if (lastAppId !== undefined && parsed.last_appid <= lastAppId) {
+          throw badResponse('Steam returned a catalog continuation marker that did not advance.');
+        }
+        lastAppId = parsed.last_appid;
+      }
+
+      throw badResponse('Steam returned too many catalog continuation pages.');
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
